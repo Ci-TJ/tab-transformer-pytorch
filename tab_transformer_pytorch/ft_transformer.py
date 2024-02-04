@@ -4,6 +4,58 @@ from torch import nn, einsum
 
 from einops import rearrange, repeat
 
+class DistributionUncertainty(nn.Module):
+    """
+    Distribution Uncertainty Module
+        Args:
+        p   (float): probabilty of foward distribution uncertainty module, p in [0,1].
+    """
+
+    def __init__(self, p=0.5, eps=1e-6):
+        super(DistributionUncertainty, self).__init__()
+        self.eps = eps
+        self.p = p
+        self.factor = 1.0
+
+    def _reparameterize(self, mu, std):
+        epsilon = torch.randn_like(std) * self.factor
+        return mu + epsilon * std
+
+    def sqrtvar(self, x):
+        t = (x.var(dim=0, keepdim=True) + self.eps).sqrt()
+        t = t.repeat(x.shape[0], 1)
+        return t
+
+    def forward(self, x, data_type="seq"):
+        if (not self.training) or (np.random.random()) > self.p:
+            return x
+        if data_type == "seq":
+            mean = x.mean(dim=[1], keepdim=False)
+            std = (x.var(dim=[1], keepdim=False) + self.eps).sqrt()
+            
+            sqrtvar_mu = self.sqrtvar(mean)
+            sqrtvar_std = self.sqrtvar(std)
+
+            beta = self._reparameterize(mean, sqrtvar_mu)
+            gamma = self._reparameterize(std, sqrtvar_std)
+
+            x = (x - mean.reshape(x.shape[0], 1, x.shape[2])) / std.reshape(x.shape[0], 1, x.shape[2])
+            x = x * gamma.reshape(x.shape[0], 1, x.shape[2]) + beta.reshape(x.shape[0], 1, x.shape[2])
+        else:
+            mean = x.mean(dim=[2, 3], keepdim=False)
+            std = (x.var(dim=[2, 3], keepdim=False) + self.eps).sqrt()
+            
+            sqrtvar_mu = self.sqrtvar(mean)
+            sqrtvar_std = self.sqrtvar(std)
+
+            beta = self._reparameterize(mean, sqrtvar_mu)
+            gamma = self._reparameterize(std, sqrtvar_std)
+
+            x = (x - mean.reshape(x.shape[0], x.shape[1], 1, 1)) / std.reshape(x.shape[0], x.shape[1], 1, 1)
+            x = x * gamma.reshape(x.shape[0], x.shape[1], 1, 1) + beta.reshape(x.shape[0], x.shape[1], 1, 1)
+
+        return x
+        
 # feedforward and attention
 
 class GEGLU(nn.Module):
@@ -70,26 +122,32 @@ class Transformer(nn.Module):
         heads,
         dim_head,
         attn_dropout,
-        ff_dropout
+        ff_dropout,
+        p = 0,
+        eps = 1e-6,
     ):
         super().__init__()
         self.layers = nn.ModuleList([])
+        self.p = p
+        self.eps = eps
 
         for _ in range(depth):
             self.layers.append(nn.ModuleList([
                 Attention(dim, heads = heads, dim_head = dim_head, dropout = attn_dropout),
                 FeedForward(dim, dropout = ff_dropout),
+                DistributionUncertainty(p=self.p, eps=self.eps),
             ]))
 
     def forward(self, x, return_attn = False):
         post_softmax_attns = []
 
-        for attn, ff in self.layers:
+        for attn, ff, dsu in self.layers:
             attn_out, post_softmax_attn = attn(x)
             post_softmax_attns.append(post_softmax_attn)
 
             x = attn_out + x
             x = ff(x) + x
+            x = dsu(x)
 
         if not return_attn:
             return x
@@ -123,7 +181,9 @@ class FTTransformer(nn.Module):
         dim_out = 1,
         num_special_tokens = 2,
         attn_dropout = 0.,
-        ff_dropout = 0.
+        ff_dropout = 0.,
+        p = 0,
+        eps = 1e-6,
     ):
         super().__init__()
         assert all(map(lambda n: n > 0, categories)), 'number of each category must be positive'
@@ -169,7 +229,9 @@ class FTTransformer(nn.Module):
             heads = heads,
             dim_head = dim_head,
             attn_dropout = attn_dropout,
-            ff_dropout = ff_dropout
+            ff_dropout = ff_dropout,
+            p=p, #forget before in tabTransformer
+            eps=eps,
         )
 
         # to logits
